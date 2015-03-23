@@ -1,0 +1,269 @@
+# -*- coding: utf-8 -*-
+
+# Written by Alexis Martin
+# See MIT license
+# Based on an original idea from Andreas Steffen, see http://security.hsr.ch/msevote/elgamal
+
+import random
+import gmpy2
+import openpyxl
+import pywin.debugger, sys, time
+import traceback
+
+# Fonctions appelées souvent
+add = gmpy2.add
+sub = gmpy2.sub
+mul = gmpy2.mul
+div = gmpy2.divm
+pow = gmpy2.powmod
+mod = gmpy2.f_mod
+mp  = gmpy2.mpz
+
+# CLASS
+class election_server:
+	# Each election server holds:
+	# s: private key
+	# h: public key
+	# p(1), p(2), ... p(NbServers) values for a randomly chosen polynomial such that p(0) = s
+
+    def __init__(self):
+        a = []
+        self.p = []
+        self.s = 0
+
+        [T, N, q, p, g] = [ConfigSys['NbThreshold'],ConfigSys['NbServers'], ConfigSys['NbQ'], ConfigSys['NbP'], ConfigSys['NbG']]
+
+        rng = random.SystemRandom()
+        for i in range (T):
+            a.append(rng.randint(1,sub(q,1)))
+        self.h = pow(g,a[0],p)
+        self.s = a[0]
+        for i in range (N):
+            self.p.append(poly(a, T-1, i+1, q))
+        
+    def print(self):
+        print ("s:",self.s)
+        print ("p:",self.p)
+        print ("h:",self.h)
+        
+# FONCTIONS
+def poly(a, n, x, m):
+ 	it = a[n]
+ 	for i in range(n):
+ 		it = mod (add(mul(it,x) , a[n-i-1]), m)
+ 	return it
+
+def lagrangien (T_serv):
+	# for each i, li = Prod (j/j-i) for j <> i and j such that T_serv(j) is one of the chosen election servers
+	# Per design if P(i)=yi then P(0)=Sum yi*li in this case, and P(0) is what we are looking for (re-constructed public key)
+
+    [N, q] = [ConfigSys['NbServers'], ConfigSys['NbQ']]
+    lag = []
+    for i in range (N):
+        if (T_serv[i] == 0):
+            lag.append(0)
+        else :
+            it = 1
+            for j in range (1,N+1):
+                if ((j != i+1) and (T_serv[j-1] == 1)) : it = mod (mul (it, div (j, j-1-i, q)), q)
+            lag.append(int(it))
+    return lag
+
+def extract_election_servers ():	
+	rng = random.SystemRandom()
+	index = []
+	loop = 0
+	while (1):
+		value = rng.randint(0,ConfigSys['NbServers']-1)
+		if value not in index:
+			index.append(value)
+			loop += 1
+		if loop == ConfigSys['NbThreshold']: break
+	T_serv = []
+	for i in range (ConfigSys['NbServers']):
+		if i in index: T_serv.append(1)
+		else: T_serv.append(0)
+	return (T_serv)
+
+#######################################################################
+def init_system():
+	# Defines system arithmetic parameters
+	# Find nth Sophie Germain prime number strictly greater than V
+	# Find g such that g, g^2,... g^q-1 generates sub group of order q
+	
+	q = ConfigSys['NbVoters'] + 1
+	n = ConfigSys['NbSophieGermain']
+	
+	for i in range(n):
+		while (1):
+			q = gmpy2.next_prime(q)
+			if gmpy2.is_prime(add(mul(2,q),1)):
+				break;
+			else:
+				q = gmpy2.next_prime(q)
+	p = add(mul(mp(2),q),mp(1))
+	print ("Q: ",q, " P: ",p)
+	
+	for ga in range (2, p-1):
+		g = pow(ga, 2, p)
+		if (g != 1): break;
+	print ("G: ",g)
+	[ConfigSys['NbQ'], ConfigSys['NbP'], ConfigSys['NbG']] = [q, p, mp(g)]
+	
+	return
+
+def init_election_servers():
+	# Create Nb_servers election servers
+	# Compute public key as product of all election servers public keys
+	# For each i, get P(i) values from all election servers and store the sum into s[i]
+
+	[N, p, q] = [ConfigSys['NbServers'], ConfigSys['NbP'], ConfigSys['NbQ']]
+	
+	elec_serv = []
+	for i in range(N):
+		elec_serv.append(election_server())
+		elec_serv[i].print()
+
+	h = mp(1)
+	for i in range(N):
+		h = mod (mul (elec_serv[i].h, h), p)
+
+	ConfigSys['PublicKey'] = h
+	ConfigSys['s'] = []
+
+	for i in range (N):
+		it = 0
+		for j in range (N):
+			it = mod (add (it, elec_serv[j].p[i]), q)
+		ConfigSys['s'].append(it)
+	return
+
+def election_manager():
+	# Defines vote parameters	
+	[p, q, v] = [ConfigSys['NbP'], ConfigSys['NbQ'], ConfigSys['NbVoters']]	
+	
+	rng = random.SystemRandom()
+	while (1):
+		m1 = mp(rng.randint(2,p-1))
+		if (pow (m1, q, p) == 1): continue
+		if (pow (m1, 2, p) == 1): continue
+		break
+	m0 = div (1, m1, p)
+	print ("m0:",m0," m1:",m1)
+
+	nb_oui = rng.randint(0,v)
+	print(v," voters, ",nb_oui," voted Yes ",v-nb_oui," voted No")
+
+	[ConfigVote['NbM0'], ConfigVote['NbM1'], ConfigVote['NbOui']] = [m0, m1, nb_oui]
+	
+	return
+
+def vote():
+	# Randomly pick r in 1...q-1
+	# Compute directly product of all Yes ballots and of all No ballots
+	# Deduce ElGamal encrypted vote result. For each j voter, xj = g^r mod p, yj = mh^r mod p, m = m0 for No vote and m1 for Yes vote
+
+    [v, p, q, g, h] = [ConfigSys['NbVoters'], ConfigSys['NbP'], ConfigSys['NbQ'], ConfigSys['NbG'], ConfigSys['PublicKey']]
+    [m0, m1, nb_oui] = [ConfigVote['NbM0'], ConfigVote['NbM1'], ConfigVote['NbOui']]
+
+    rng = random.SystemRandom()
+
+    r = rng.randint(1, q-1)
+    tx = pow (pow (g, r, p), v, p)
+    ty = pow (mul (m1, pow(h, r, p)), nb_oui, p)
+    ty = mod (mul ( pow (mul (m0, pow(h, r, p)), sub (v, nb_oui), p), ty), p)
+    [ConfigVote['NbTX'], ConfigVote['NbTY']] = [tx, ty]
+    return
+
+def tally():
+	# Decrypt vote result TX, TY = product of all encrypted ballots:
+	# Get servers public keys s[i]
+	# Using Lagrangian parameters, use only NbThreshold servers s[i] keys among all servers as s = sum s[i]*l[i]
+	# Compute ts = tx ^s
+	# Compute tm = ty / ts, tm is the unencrypted product of all ballots
+
+    w = []
+    [p, q, T, N, s] = [ConfigSys['NbP'],ConfigSys['NbQ'],ConfigSys['NbThreshold'],ConfigSys['NbServers'], ConfigSys['s']]
+    for i in range (N):
+        w.append(pow(ConfigVote['NbTX'], s[i], p))
+        
+    l = lagrangien(extract_election_servers())
+    
+    it = mp(1)
+    for i in range (N):
+        it = mod(mul(it, pow(w[i], mp(l[i]), p)), p)
+    tm = div (ConfigVote['NbTY'], it, p)
+    ConfigVote ['NbTS'] = it
+    ConfigVote ['NbTM'] = tm
+    
+    return
+
+
+def display_results():
+	# Leverage the fact that m0*m1 = 1
+	# Therefore tm = m1^(number of yes - number of no) or tm = m0^(number of no - number of yes)
+	# With a linear search, find out number of yes - number of no value and deduce then number of yes and number of no.
+
+    [v, p]  = [ConfigSys['NbVoters'], ConfigSys['NbP']]
+    [somme, tm, m0, m1] = [ConfigVote['NbOui'], ConfigVote['NbTM'], ConfigVote['NbM0'], ConfigVote['NbM1']]
+    
+    if (tm == 1):
+        print ("No winner")
+        oui = gmpy2.divexact(v,mp(2))
+        print ("Number of unencrypted Yes:", oui," == Number of cast Yes:",somme)
+        if (somme == oui):
+            return (1)
+        else: return (0)
+
+    it = mp(1)
+    for i in range (v):
+        it = mod (mul (it, m0), p)
+        if (tm == it):
+            oui = gmpy2.divexact(sub(mp(v),add(mp(i),mp(1))),mp(2))
+            print ("Number of unencrypted Yes: ", oui, "Number of unencrypted No: ", sub(mp(v),oui))
+            if (somme == oui):
+                return (1)
+            else:
+                print ("ERROR: No is the winner i:",i," tm:",tm," Unencrypted number of Yes:", oui," != Number of cast Yes:", somme)
+                return (0)
+            
+    it = mp(1)
+    for i in range (v):
+        it = mod (mul (it, m1), p)
+        if (tm == it):
+            oui = gmpy2.divexact(add(mp(v),add(mp(i),mp(1))),mp(2))
+            print ("Number of unencrypted Yes: ",oui , "Number of unencrypted No: ", sub(mp(v), oui))
+            if (somme == oui):
+                return (1)
+            else:
+                print ("ERROR Yes is the winner i:",i," tm:",tm," Unencrypted number of Yes:", oui," != Number of cast Yes:", somme)
+                return (0)
+
+print ("START")
+
+#INIT
+ConfigSys = {'NbVoters':50000, 'NbServers':20, 'NbThreshold':15, 'NbSophieGermain':5}
+
+init_system()
+init_election_servers()
+
+#VOTE
+for i in range(10000):
+	print("\nVote n°",i,":")
+	ConfigVote = {}
+
+	election_manager()
+
+	vote()
+
+	tally()
+
+	if (not display_results()):
+		[v, p] = [ConfigSys['NbVoters'], ConfigSys['NbP']]
+		[tm, m0, m1, nb_oui] = [ConfigVote['NbTM'], ConfigVote['NbM0'],ConfigVote['NbM1'],ConfigVote['NbOui']] 
+		print("ERROR")
+		print ("Tm as cast", pow (m1, nb_oui - (v - nb_oui), p), " or: ", pow (m0, (v - nb_oui) - nb_oui, p))
+		print ("Unencrypted Tm:",tm)
+		break
+
+print ("FIN")
